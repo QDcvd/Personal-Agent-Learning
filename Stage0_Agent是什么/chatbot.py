@@ -45,7 +45,7 @@ class SimpleChatbot:
         return reply
     
 if __name__ == '__main__':
-    chat = SimpleChatbot(api_key='sk-你的DeepSeekAPIKey',
+    chat = SimpleChatbot(api_key='sk-你的DeepSeekAPIKey',  # ⚠️ 替换为你的 DeepSeek API Key（已删除敏感 key）
                          system_prompt="你是一个数据助手。请始终用 JSON 格式回复。输出格式你来定\n"
                          )  # 替换为你的 DeepSeek API Key
     while True:

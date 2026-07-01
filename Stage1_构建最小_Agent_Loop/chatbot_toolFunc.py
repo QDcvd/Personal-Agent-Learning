@@ -425,7 +425,7 @@ class SimpleChatbot:
 if __name__ == '__main__':
     # 创建 chatbot 实例：配置 API Key、系统提示词、注册 grep 工具
     chat = SimpleChatbot(
-        api_key='sk-你的DeepSeekAPIKey',  # 替换为你的 DeepSeek API Key
+        api_key='sk-你的DeepSeekAPIKey',  # ⚠️ 替换为你的 DeepSeek API Key（已删除敏感 key）
         system_prompt="你是一个文件搜索助手。你可以使用以下工具帮助用户搜索文件：\n"
                        "1. grep_search — 在 Linux/WSL 中搜索文件内容（正则表达式）\n"
                        "2. find_search — 在 Linux/WSL 中按文件名搜索文件\n"
