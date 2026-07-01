@@ -2,6 +2,10 @@ from openai import OpenAI  # 导入 OpenAI SDK（DeepSeek 兼容该接口）
 import json                # 用于序列化/反序列化工具调用参数
 import subprocess          # 用于执行 Linux grep / find / ls 等命令
 import pathlib             # 用于跨平台文件搜索（Windows / Linux 均适用）
+from dotenv import load_dotenv  # 从 .env 文件加载环境变量
+import os                  # 读取环境变量
+
+load_dotenv()  # 加载 .env 文件（含 DEEPSEEK_API_KEY）
 
 
 def grep_search(pattern: str, path: str = ".") -> str:
@@ -202,15 +206,18 @@ class SimpleChatbot:
 
     def __init__(
         self,
-        api_key: str,                     # DeepSeek / OpenAI API 密钥
-        model: str = "deepseek-v4-flash",  # 模型名称
-        system_prompt: str = None,        # 可选的系统提示词
-        tools: list = None                # 可选的工具定义列表
+        api_key: str = None,               # DeepSeek / OpenAI API 密钥，默认从 .env 读取
+        model: str = None,                 # 模型名称，默认从 .env 读取
+        system_prompt: str = None,         # 可选的系统提示词
+        tools: list = None                 # 可选的工具定义列表
     ):
         """初始化聊天机器人，支持自定义模型、系统提示词和工具。"""
         # 创建 OpenAI 兼容客户端，注意 base_url 指向 DeepSeek 的 API 地址
-        self.client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-        self.model = model       # 模型名称
+        self.client = OpenAI(
+            api_key=api_key or os.getenv("DEEPSEEK_API_KEY"),
+            base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        )
+        self.model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
         self.messages = []       # 对话历史，存储所有消息
         # 如果有 system_prompt，作为第一条消息注入对话
         if system_prompt:
@@ -425,7 +432,7 @@ class SimpleChatbot:
 if __name__ == '__main__':
     # 创建 chatbot 实例：配置 API Key、系统提示词、注册 grep 工具
     chat = SimpleChatbot(
-        api_key='sk-你的DeepSeekAPIKey',  # ⚠️ 替换为你的 DeepSeek API Key（已删除敏感 key）
+        # api_key 自动从 .env 文件读取 DEEPSEEK_API_KEY
         system_prompt="你是一个文件搜索助手。你可以使用以下工具帮助用户搜索文件：\n"
                        "1. grep_search — 在 Linux/WSL 中搜索文件内容（正则表达式）\n"
                        "2. find_search — 在 Linux/WSL 中按文件名搜索文件\n"

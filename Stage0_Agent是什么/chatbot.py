@@ -1,9 +1,17 @@
 from openai import OpenAI
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
 
 class SimpleChatbot:
-    def __init__(self, api_key, model="deepseek-v4-flash", system_prompt=None):
-        self.client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-        self.model = model
+    def __init__(self, api_key=None, model=None, system_prompt=None):
+        self.client = OpenAI(
+            api_key=api_key or os.getenv("DEEPSEEK_API_KEY"),
+            base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        )
+        self.model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
         self.messages = []  # 简单的对话历史
         if system_prompt:
             self.messages.append({"role": "system", "content": system_prompt})
@@ -45,9 +53,10 @@ class SimpleChatbot:
         return reply
     
 if __name__ == '__main__':
-    chat = SimpleChatbot(api_key='sk-你的DeepSeekAPIKey',  # ⚠️ 替换为你的 DeepSeek API Key（已删除敏感 key）
-                         system_prompt="你是一个数据助手。请始终用 JSON 格式回复。输出格式你来定\n"
-                         )  # 替换为你的 DeepSeek API Key
+    # 无需传 api_key，自动从 .env 文件读取 DEEPSEEK_API_KEY
+    chat = SimpleChatbot(
+        system_prompt="你是一个数据助手。请始终用 JSON 格式回复。输出格式你来定\n"
+    )
     while True:
         meessages = input('请输入对话：')
         meessages = chat.chat(meessages)
