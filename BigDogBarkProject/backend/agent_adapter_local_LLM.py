@@ -8,6 +8,7 @@ The stream is deliberately split into two phases:
 import asyncio
 import fnmatch
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -45,7 +46,19 @@ MAX_RETURN_CHARS = 2000
 MAX_READ_CHARS = 4000
 AGENT_TIMEOUT_SECONDS = 90
 FINAL_ANSWER_TIMEOUT_SECONDS = 60
+ROUTE_TIMEOUT_SECONDS = 8
 
+FINAL_MARKER_PATTERN = re.compile(
+    r"(?:^|\n)\s*(?:\d+\.\s*)?(?:final\s+output\s+generation|final\s+answer|"
+    r"final\s+response|final|answer|response|最终回答|最终答案|最终|答案|回答)\s*[:：]\s*",
+    flags=re.IGNORECASE,
+)
+THINKING_MARKER_PATTERN = re.compile(
+    r"(?:here(?:'s| is)\s+a\s+thinking\s+process|thinking\s+process|reasoning\s+process|"
+    r"analysis\s+process|internal\s+reasoning|analyze\s+user\s+input|check\s+constraints|"
+    r"identify\s+key\s+constraints|思考过程|推理过程|分析过程)\s*[:：]",
+    flags=re.IGNORECASE,
+)
 _agent = None
 _model = None
 
@@ -166,12 +179,23 @@ def read_file_tool(path: str) -> str:
         return f"Read failed: {e}"
 
 
+@tool
+def web_search_tool(query: str) -> str:
+    """在互联网上搜索信息"""
+    import subprocess
+    result = subprocess.run(
+        ["curl", "-s", f"https://html.duckduckgo.com/html/?q={query}"],
+        capture_output=True, text=True, timeout=15
+    )
+    return result.stdout[:2000]
+
+
 def get_model() -> ChatOpenAI:
     """Return the shared chat model."""
     global _model
     if _model is None:
         _model = ChatOpenAI(
-            model=os.getenv("LLM_MODEL", "qwen3.6-27b-awq-int4"),
+            model=os.getenv("LLM_MODEL", "qwen3.6"),
             api_key=os.getenv("LLM_API_KEY", "not-needed"),
             base_url=os.getenv("LLM_BASE_URL", "http://100.81.149.79:8000/v1"),
             temperature=0,
@@ -183,7 +207,7 @@ def get_agent():
     """Return the shared tool agent."""
     global _agent
     if _agent is None:
-        _agent = create_react_agent(get_model(), tools=[find_tool, read_file_tool])
+        _agent = create_react_agent(get_model(), tools=[find_tool, read_file_tool, web_search_tool])
     return _agent
 
 
@@ -199,6 +223,71 @@ def _message_content_to_text(content: Any) -> str:
                 text += block.get("text", "")
         return text
     return ""
+
+
+def _message_reasoning_to_text(chunk: AIMessageChunk) -> str:
+    reasoning = getattr(chunk, "reasoning_content", None)
+    if isinstance(reasoning, str):
+        return reasoning
+
+    additional_kwargs = getattr(chunk, "additional_kwargs", {}) or {}
+    reasoning = additional_kwargs.get("reasoning_content")
+    if isinstance(reasoning, str):
+        return reasoning
+
+    content = getattr(chunk, "content", None)
+    if isinstance(content, list):
+        text = ""
+        for block in content:
+            if isinstance(block, dict):
+                value = block.get("reasoning_content") or block.get("reasoning")
+                if isinstance(value, str):
+                    text += value
+        return text
+    return ""
+
+
+def _pick_final_answer(text: str) -> str:
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    chinese_lines = [line for line in lines if re.search(r"[\u4e00-\u9fff]", line)]
+    if chinese_lines:
+        return chinese_lines[-1].strip("“”\"' ")
+    return text.strip()
+
+
+def _split_local_llm_output(text: str) -> tuple[str, str]:
+    """Return (thinking, answer) while keeping Qwen analysis out of final content."""
+    if not text:
+        return "", ""
+
+    thinking_parts = [
+        block.strip()
+        for block in re.findall(r"<think>(.*?)</think>", text, flags=re.IGNORECASE | re.DOTALL)
+        if block.strip()
+    ]
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+
+    final_matches = list(FINAL_MARKER_PATTERN.finditer(cleaned))
+    if final_matches:
+        marker = final_matches[-1]
+        prefix = cleaned[:marker.start()].strip()
+        answer_source = cleaned[marker.end():].strip()
+        if prefix:
+            thinking_parts.append(prefix)
+        answer = _pick_final_answer(answer_source)
+        trailing_thinking = answer_source[: answer_source.rfind(answer)].strip() if answer else ""
+        if trailing_thinking:
+            thinking_parts.append(trailing_thinking)
+        return "\n\n".join(thinking_parts).strip(), answer
+
+    if THINKING_MARKER_PATTERN.search(cleaned):
+        answer = _pick_final_answer(cleaned)
+        thinking = cleaned[: cleaned.rfind(answer)].strip() if answer else cleaned
+        if thinking:
+            thinking_parts.append(thinking)
+        return "\n\n".join(thinking_parts).strip(), answer
+
+    return "\n\n".join(thinking_parts).strip(), cleaned
 
 
 def _tool_call_name(call: Any) -> str:
@@ -288,9 +377,69 @@ def _build_final_prompt(user_text: str, trace: dict, tool_context: list[dict]) -
     return [SystemMessage(content=system), HumanMessage(content=user)]
 
 
+def _build_route_prompt(user_text: str) -> list[Any]:
+    return [
+        SystemMessage(
+            content=(
+                "Classify the user request. Return exactly one word: tools or direct_chat.\n"
+                "tools = the user needs reading/searching local files, folders, code, paths, README, docs, or project contents.\n"
+                "direct_chat = normal chat, identity, explanation, writing, general knowledge, or anything not requiring local files."
+            )
+        ),
+        HumanMessage(content=f"User request:\n{user_text}\n\nRoute:"),
+    ]
+
+
+async def _route_query(user_text: str) -> str:
+    try:
+        async with asyncio.timeout(ROUTE_TIMEOUT_SECONDS):
+            result = await get_model().ainvoke(_build_route_prompt(user_text))
+    except Exception:
+        return "direct_chat"
+
+    raw = _message_reasoning_to_text(result) + _message_content_to_text(result.content)
+    answer = _split_local_llm_output(raw)[1].lower()
+    return "tools" if re.search(r"\btools\b", answer) else "direct_chat"
+
+
+def _build_direct_chat_prompt(user_text: str, history: list[dict]) -> list[Any]:
+    messages: list[Any] = [
+        SystemMessage(
+            content=(
+                "You are BigDog, a concise Chinese assistant. Answer directly. "
+                "Do not mention tool calls, internal analysis, or hidden reasoning."
+            )
+        )
+    ]
+    for msg in history[-6:]:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role == "user":
+            messages.append(("user", content))
+        elif role == "assistant":
+            messages.append(("ai", content))
+    messages.append(HumanMessage(content=user_text))
+    return messages
+
+
+async def _stream_model_answer(messages: list[Any]):
+    raw_output = ""
+    async for chunk in get_model().astream(messages):
+        if not isinstance(chunk, AIMessageChunk):
+            continue
+
+        raw_output += _message_reasoning_to_text(chunk)
+        raw_output += _message_content_to_text(chunk.content)
+
+    thinking, answer = _split_local_llm_output(raw_output)
+    if thinking:
+        yield {"type": "thinking", "content": thinking}
+    if answer:
+        yield {"type": "content", "content": answer}
+
+
 async def stream_search_agent(user_text: str, history: list[dict]):
     """Yield SSE event dictionaries for process trace and final answer."""
-    agent = get_agent()
     trace = {
         "tool_used": False,
         "tool_name": None,
@@ -304,6 +453,26 @@ async def stream_search_agent(user_text: str, history: list[dict]):
     }
     tool_context: list[dict] = []
     pending_tool_args: dict[str, dict] = {}
+
+    route = await _route_query(user_text)
+    if route == "direct_chat":
+        trace["retrieval_stage"] = "direct_chat"
+        trace["retrieval_mode"] = "no_tools"
+        yield {"type": "trace", "rag_trace": trace}
+        yield {"type": "rag_step", "step": {"label": "正在直接回应...", "icon": "✍️"}}
+        try:
+            async with asyncio.timeout(FINAL_ANSWER_TIMEOUT_SECONDS):
+                async for event in _stream_model_answer(_build_direct_chat_prompt(user_text, history)):
+                    yield event
+        except asyncio.TimeoutError:
+            yield {"type": "error", "content": f"最终回答生成超时：超过 {FINAL_ANSWER_TIMEOUT_SECONDS}s"}
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            yield {"type": "error", "content": f"最终回答生成出错: {str(e)}"}
+        return
+
+    agent = get_agent()
 
     yield {"type": "rag_step", "step": {"label": "正在理解问题...", "icon": "🧠"}}
 
@@ -376,19 +545,8 @@ async def stream_search_agent(user_text: str, history: list[dict]):
 
     try:
         async with asyncio.timeout(FINAL_ANSWER_TIMEOUT_SECONDS):
-            async for chunk in get_model().astream(_build_final_prompt(user_text, trace, tool_context)):
-                if not isinstance(chunk, AIMessageChunk):
-                    continue
-
-                # 分离推理过程（本地 Qwen 的 reasoning_content 字段）
-                reasoning = getattr(chunk, "reasoning_content", None) or ""
-                if reasoning:
-                    yield {"type": "thinking", "content": reasoning}
-
-                # 普通文本内容
-                content = _message_content_to_text(chunk.content)
-                if content:
-                    yield {"type": "content", "content": content}
+            async for event in _stream_model_answer(_build_final_prompt(user_text, trace, tool_context)):
+                yield event
     except asyncio.TimeoutError:
         yield {"type": "error", "content": f"最终回答生成超时：超过 {FINAL_ANSWER_TIMEOUT_SECONDS}s"}
     except asyncio.CancelledError:
