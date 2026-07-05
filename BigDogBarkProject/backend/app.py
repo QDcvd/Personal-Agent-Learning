@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+import traceback
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +21,7 @@ from backend.memory_store import (
     get_messages,
     update_session_title,
 )
+from backend.context_manager import build_agent_history
 from backend.rag_stub import router as rag_router
 import importlib
 
@@ -28,6 +31,14 @@ import importlib
 _adapter_name = os.getenv("AGENT_ADAPTER", "agent_adapter")
 _adapter = importlib.import_module(f"backend.{_adapter_name}")
 stream_search_agent = _adapter.stream_search_agent
+ERROR_LOG = Path(__file__).resolve().parent.parent / "backend-error.log"
+print(
+    "[adapter] "
+    f"AGENT_ADAPTER={_adapter_name} "
+    f"module={getattr(_adapter, '__file__', 'unknown')} "
+    f"BIGDOG_LLM_DEBUG={os.getenv('BIGDOG_LLM_DEBUG', '')}",
+    flush=True,
+)
 
 # ── FastAPI 应用 ──
 
@@ -121,6 +132,11 @@ async def remove_session(session_id: str):
 @app.post("/chat/stream")
 async def chat_stream(body: ChatRequest):
     """流式聊天接口 — 返回 SSE 事件流"""
+    if os.getenv("BIGDOG_LLM_DEBUG", "").strip().lower() in {"1", "true", "yes", "on", "debug"}:
+        print(
+            f"[debug] 收到聊天请求 session_id={body.session_id} message={body.message!r}",
+            flush=True,
+        )
 
     # 确保会话存在
     session = get_session(body.session_id)
@@ -132,12 +148,12 @@ async def chat_stream(body: ChatRequest):
     add_message(body.session_id, "human", body.message)
 
     # 构造历史消息格式（给 agent_adapter 使用）
-    history = []
-    history = []
     all_msgs = get_messages(body.session_id)
-    for msg in all_msgs[:-1]:  # 排除刚加入的用户消息
-        role = "user" if msg["type"] == "human" else "assistant"
-        history.append({"role": role, "content": msg["content"]})
+    # DEPRECATED: 不再用粗暴的 {role, content} 历史列表。
+    # 那种做法会丢掉上一轮工具调用、工具结果和 rag_trace，导致“那/它/这个文件”
+    # 这类追问失去指向。现在统一交给 context_manager 做 Zleap 风格的上下文投影：
+    # message + synthetic tool_call/tool_result + trace context note。
+    history = build_agent_history(all_msgs[:-1])  # 排除刚加入的用户消息
 
     async def event_generator():
         """SSE 事件生成器"""
@@ -145,6 +161,8 @@ async def chat_stream(body: ChatRequest):
         rag_trace = None
         try:
             async for event in stream_search_agent(body.message, history):
+                if os.getenv("BIGDOG_LLM_DEBUG", "").strip().lower() in {"1", "true", "yes", "on", "debug"}:
+                    print(f"[debug] SSE事件 type={event.get('type')}", flush=True)
                 if event.get("type") == "content":
                     full_response += event.get("content", "")
                 elif event.get("type") == "trace":
@@ -158,6 +176,9 @@ async def chat_stream(body: ChatRequest):
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            error_text = traceback.format_exc()
+            print(error_text, flush=True)
+            ERROR_LOG.write_text(error_text, encoding="utf-8")
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 

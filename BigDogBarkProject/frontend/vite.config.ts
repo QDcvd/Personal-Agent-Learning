@@ -36,7 +36,7 @@ export default defineConfig({
   },
   server: {
     host: '0.0.0.0',
-    port: 3000,
+    port: 5173,
     proxy: {
       // 代理后端接口，方便开发联调
       '/auth': 'http://localhost:8000',

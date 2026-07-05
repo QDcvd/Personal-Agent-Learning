@@ -7,14 +7,16 @@ The stream is deliberately split into two phases:
 
 import asyncio
 import fnmatch
+import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
@@ -40,12 +42,12 @@ EXCLUDED_DIRS = {
     "build",
 }
 MAX_SEARCH_SECONDS = 5.0
-MAX_VISITED_FILES = 20000
+MAX_VISITED_FILES = 90000
 MAX_MATCHES = 80
 MAX_RETURN_CHARS = 2000
 MAX_READ_CHARS = 4000
-AGENT_TIMEOUT_SECONDS = 90
-FINAL_ANSWER_TIMEOUT_SECONDS = 60
+AGENT_TIMEOUT_SECONDS = 900
+FINAL_ANSWER_TIMEOUT_SECONDS = 180
 ROUTE_TIMEOUT_SECONDS = 8
 
 FINAL_MARKER_PATTERN = re.compile(
@@ -61,6 +63,62 @@ THINKING_MARKER_PATTERN = re.compile(
 )
 _agent = None
 _model = None
+
+
+def _llm_debug_enabled() -> bool:
+    return os.getenv("BIGDOG_LLM_DEBUG", "").strip().lower() in {"1", "true", "yes", "on", "debug"}
+
+
+def _debug_plain_value(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump()
+        except Exception:
+            pass
+    if hasattr(value, "dict"):
+        try:
+            return value.dict()
+        except Exception:
+            pass
+    if isinstance(value, dict):
+        return {str(key): _debug_plain_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_debug_plain_value(item) for item in value]
+    return value
+
+
+def _debug_dump_model_return(label: str, value: Any) -> None:
+    if not _llm_debug_enabled():
+        return
+
+    payload = {
+        "标签": label,
+        "类型": f"{type(value).__module__}.{type(value).__name__}",
+        "完整对象": _debug_plain_value(value),
+        "repr": repr(value),
+    }
+    if isinstance(value, (AIMessage, AIMessageChunk)):
+        payload["content"] = getattr(value, "content", None)
+        payload["tool_calls"] = getattr(value, "tool_calls", None)
+        payload["invalid_tool_calls"] = getattr(value, "invalid_tool_calls", None)
+        payload["additional_kwargs"] = getattr(value, "additional_kwargs", None)
+        payload["response_metadata"] = getattr(value, "response_metadata", None)
+        payload["usage_metadata"] = getattr(value, "usage_metadata", None)
+        payload["id"] = getattr(value, "id", None)
+
+    try:
+        text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        text = repr(payload)
+
+    print("\n========== 大模型返回值调试开始 ==========", file=sys.stderr, flush=True)
+    print(text, file=sys.stderr, flush=True)
+    print("========== 大模型返回值调试结束 ==========\n", file=sys.stderr, flush=True)
+
+
+def _debug_log(message: str) -> None:
+    if _llm_debug_enabled():
+        print(f"[llm-debug] {message}", file=sys.stderr, flush=True)
 
 
 def _format_limit_notes(
@@ -96,7 +154,7 @@ def _extract_paths_from_tool_text(text: str) -> list[str]:
 
 @tool
 def find_tool(path: str = ".", pattern: str = "*") -> str:
-    """Recursively search for files by filename pattern."""
+    """按文件名模式递归查找本地文件。"""
     try:
         root = Path(path).expanduser()
         if not root.exists():
@@ -164,7 +222,7 @@ def find_tool(path: str = ".", pattern: str = "*") -> str:
 
 @tool
 def read_file_tool(path: str) -> str:
-    """Read a text file and return a bounded excerpt."""
+    """读取本地文本文件，并返回长度受限的内容片段。"""
     try:
         p = Path(path).expanduser()
         if not p.exists():
@@ -190,6 +248,29 @@ def web_search_tool(query: str) -> str:
     return result.stdout[:2000]
 
 
+def _get_tools() -> list[Any]:
+    """返回暴露给 Agent 的工具列表。"""
+    return [find_tool, read_file_tool, web_search_tool]
+
+
+def _build_tool_inventory_prompt(tools: list[Any]) -> str:
+    """根据实际注册工具生成中文系统提示词片段。"""
+    lines = [
+        "可用工具列表：",
+        "当用户要求搜索、读取文件、查看项目，或明确点名某个工具时，你可以使用下列工具。",
+    ]
+    for item in tools:
+        name = getattr(item, "name", getattr(item, "__name__", "tool"))
+        description = (getattr(item, "description", None) or getattr(item, "__doc__", "") or "").strip()
+        args = getattr(item, "args", None)
+        if isinstance(args, dict) and args:
+            args_text = ", ".join(args.keys())
+        else:
+            args_text = "见工具参数结构"
+        lines.append(f"- {name}({args_text}): {description}")
+    return "\n".join(lines)
+
+
 def get_model() -> ChatOpenAI:
     """Return the shared chat model."""
     global _model
@@ -197,8 +278,9 @@ def get_model() -> ChatOpenAI:
         _model = ChatOpenAI(
             model=os.getenv("LLM_MODEL", "qwen3.6"),
             api_key=os.getenv("LLM_API_KEY", "not-needed"),
-            base_url=os.getenv("LLM_BASE_URL", "http://100.81.149.79:8000/v1"),
+            base_url=os.getenv("LLM_BASE_URL", "http://127.0.0.1:8000/v1"),
             temperature=0,
+            max_tokens=int(os.getenv("LLM_MAX_TOKENS", "1024")),
         )
     return _model
 
@@ -207,7 +289,18 @@ def get_agent():
     """Return the shared tool agent."""
     global _agent
     if _agent is None:
-        _agent = create_react_agent(get_model(), tools=[find_tool, read_file_tool, web_search_tool])
+        tools = _get_tools()
+        agent_prompt = (
+            "你是 BigDog，一个会使用工具的中文助手。\n"
+            f"{_build_tool_inventory_prompt(tools)}\n\n"
+            "工具使用规则：\n"
+            "- 如果用户明确点名某个工具，就调用该工具。\n"
+            "- 如果用户要求网页搜索、网络搜索、联网查询、在线查找、最新信息，或说“搜索”“网络搜索”“联网查询”，就调用 web_search_tool。\n"
+            "- 如果用户要求查找本地项目文件，就调用 find_tool。\n"
+            "- 如果用户要求查看、阅读、总结某个具体本地文件，就调用 read_file_tool。\n"
+            "- 只要可用工具能够满足用户请求，就不要声称自己无法使用工具。"
+        )
+        _agent = create_react_agent(get_model(), tools=tools, prompt=agent_prompt)
     return _agent
 
 
@@ -356,23 +449,23 @@ def _build_final_prompt(user_text: str, trace: dict, tool_context: list[dict]) -
     context_lines = []
     for index, item in enumerate(tool_context, start=1):
         context_lines.append(
-            f"[{index}] tool={item['tool_name']} args={item['args']}\n{item['content']}"
+            f"[{index}] 工具={item['tool_name']} 参数={item['args']}\n{item['content']}"
         )
-    context = "\n\n".join(context_lines) or "No tool context was collected."
+    context = "\n\n".join(context_lines) or "没有收集到工具上下文。"
 
     system = (
-        "You are BigDog, a concise assistant. Produce only the final answer for the user. "
-        "Do not narrate internal search steps, tool calls, failed patterns, or raw logs. "
-        "If files were found, summarize the useful results and mention relevant filenames. "
-        "If the context is insufficient, say what is missing briefly."
+        "你是 BigDog，一个简洁的中文助手。请只输出给用户看的最终回答。"
+        "不要复述内部搜索步骤、工具调用过程、失败模式或原始日志。"
+        "如果找到了文件或网页信息，请总结有用结果，并在必要时提到相关文件名或来源。"
+        "如果上下文不足，请简短说明还缺少什么。"
     )
     user = (
-        f"User question:\n{user_text}\n\n"
-        f"Collected search context:\n{context}\n\n"
-        f"Trace summary:\n"
-        f"- searched_paths: {trace.get('searched_paths', [])}\n"
-        f"- matched_files: {trace.get('matched_files', [])}\n"
-        "Now write the clean final answer in Chinese."
+        f"用户问题：\n{user_text}\n\n"
+        f"已收集的工具上下文：\n{context}\n\n"
+        f"检索摘要：\n"
+        f"- 搜索路径：{trace.get('searched_paths', [])}\n"
+        f"- 匹配文件：{trace.get('matched_files', [])}\n"
+        "请用中文写出干净、直接的最终回答。"
     )
     return [SystemMessage(content=system), HumanMessage(content=user)]
 
@@ -381,19 +474,27 @@ def _build_route_prompt(user_text: str) -> list[Any]:
     return [
         SystemMessage(
             content=(
-                "Classify the user request. Return exactly one word: tools or direct_chat.\n"
-                "tools = the user needs reading/searching local files, folders, code, paths, README, docs, or project contents.\n"
-                "direct_chat = normal chat, identity, explanation, writing, general knowledge, or anything not requiring local files."
+                "你是请求路由器，只能输出一个英文单词：tools 或 direct_chat。\n"
+                "可用工具名单：find_tool, read_file_tool, web_search_tool。\n"
+                "输出 tools：用户要求搜索、查找、读取文件、查看项目、README、代码、路径、联网搜索、网络搜索、搜索一下、最新信息，或明确提到任一工具名。\n"
+                "输出 direct_chat：普通闲聊、身份问题、解释概念、写作润色，且不需要任何工具。\n"
+                "示例：使用web_search_tool进行搜索 => tools\n"
+                "示例：网络搜索大狗大狗叫叫叫是什么东西 => tools\n"
+                "示例：查找 README => tools\n"
+                "示例：你是什么模型 => direct_chat\n"
+                "不要解释，不要输出标点。"
             )
         ),
-        HumanMessage(content=f"User request:\n{user_text}\n\nRoute:"),
+        HumanMessage(content=f"用户请求：\n{user_text}\n\n路由结果："),
     ]
 
 
 async def _route_query(user_text: str) -> str:
     try:
         async with asyncio.timeout(ROUTE_TIMEOUT_SECONDS):
+            _debug_log("旧local即将请求路由模型")
             result = await get_model().ainvoke(_build_route_prompt(user_text))
+            _debug_dump_model_return("旧local路由模型返回", result)
     except Exception:
         return "direct_chat"
 
@@ -406,8 +507,8 @@ def _build_direct_chat_prompt(user_text: str, history: list[dict]) -> list[Any]:
     messages: list[Any] = [
         SystemMessage(
             content=(
-                "You are BigDog, a concise Chinese assistant. Answer directly. "
-                "Do not mention tool calls, internal analysis, or hidden reasoning."
+                "你是 BigDog，一个简洁的中文助手。请直接回答用户。"
+                "不要提及工具调用、内部分析或隐藏推理。"
             )
         )
     ]
@@ -424,7 +525,9 @@ def _build_direct_chat_prompt(user_text: str, history: list[dict]) -> list[Any]:
 
 async def _stream_model_answer(messages: list[Any]):
     raw_output = ""
+    _debug_log(f"旧local即将开始流式请求大模型，消息数量={len(messages)}")
     async for chunk in get_model().astream(messages):
+        _debug_dump_model_return("旧local流式模型返回片段", chunk)
         if not isinstance(chunk, AIMessageChunk):
             continue
 
@@ -478,6 +581,7 @@ async def stream_search_agent(user_text: str, history: list[dict]):
 
     try:
         async with asyncio.timeout(AGENT_TIMEOUT_SECONDS):
+            _debug_log("旧local即将开始 agent.astream 工具流程")
             async for update in agent.astream(
                 {"messages": _build_agent_messages(user_text, history)},
                 stream_mode="updates",
@@ -487,6 +591,7 @@ async def stream_search_agent(user_text: str, history: list[dict]):
                     if not isinstance(output, dict) or "messages" not in output:
                         continue
                     msg = output["messages"][-1]
+                    _debug_dump_model_return(f"旧local agent节点返回-{node_name}", msg)
 
                     tool_calls = getattr(msg, "tool_calls", None) or []
                     for call in tool_calls:

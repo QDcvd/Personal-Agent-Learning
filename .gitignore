@@ -20,3 +20,14 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Node
+node_modules/
+frontend/node_modules/.vite/
+
+# Build output
+frontend/dist/
+
+# Debug & logs
+debug-llm-*.json
+run-debug.*
